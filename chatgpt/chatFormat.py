@@ -8,6 +8,7 @@ import uuid
 
 import pybase64
 import websockets
+from fastapi import HTTPException
 
 from api.files import get_file_content
 from api.models import model_system_fingerprint
@@ -47,7 +48,10 @@ async def format_not_stream_response(response, prompt_tokens, max_tokens, model)
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens
     }
-    return {
+    if not message.get("content"):
+        raise HTTPException(status_code=403, detail="No content in the message.")
+
+    data = {
         "id": chat_id,
         "object": "chat.completion",
         "created": created_time,
@@ -60,9 +64,11 @@ async def format_not_stream_response(response, prompt_tokens, max_tokens, model)
                 "finish_reason": finish_reason
             }
         ],
-        "usage": usage,
-        "system_fingerprint": system_fingerprint
+        "usage": usage
     }
+    if system_fingerprint:
+        data["system_fingerprint"] = system_fingerprint
+    return data
 
 
 async def wss_stream_response(websocket, conversation_id):
@@ -102,19 +108,56 @@ async def wss_stream_response(websocket, conversation_id):
             continue
 
 
+async def head_process_response(response):
+    async for chunk in response:
+        chunk = chunk.decode("utf-8")
+        if chunk.startswith("data: {"):
+            chunk_old_data = json.loads(chunk[6:])
+            message = chunk_old_data.get("message", {})
+            if not message and "error" in chunk_old_data:
+                return response, False
+            role = message.get('author', {}).get('role')
+            if role == 'user' or role == 'system':
+                continue
+
+            status = message.get("status")
+            if status == "in_progress":
+                return response, True
+    return response, False
+
+
 async def stream_response(service, response, model, max_tokens):
     chat_id = f"chatcmpl-{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(29))}"
     system_fingerprint_list = model_system_fingerprint.get(model, None)
     system_fingerprint = random.choice(system_fingerprint_list) if system_fingerprint_list else None
     created_time = int(time.time())
-    completion_tokens = -1
+    completion_tokens = 0
     len_last_content = 0
     len_last_citation = 0
+    last_message_id = None
+    last_role = None
     last_content_type = None
     last_recipient = None
-    start = False
     end = False
-    message_id = None
+
+    chunk_new_data = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created_time,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "logprobs": None,
+                "finish_reason": None
+            }
+        ]
+    }
+    if system_fingerprint:
+        chunk_new_data["system_fingerprint"] = system_fingerprint
+    yield f"data: {json.dumps(chunk_new_data)}\n\n"
+
     async for chunk in response:
         chunk = chunk.decode("utf-8")
         if end:
@@ -125,22 +168,15 @@ async def stream_response(service, response, model, max_tokens):
                 chunk_old_data = json.loads(chunk[6:])
                 finish_reason = None
                 message = chunk_old_data.get("message", {})
+                conversation_id = chunk_old_data.get("conversation_id")
                 role = message.get('author', {}).get('role')
                 if role == 'user' or role == 'system':
                     continue
 
                 status = message.get("status")
-                if start:
-                    pass
-                elif status == "in_progress":
-                    start = True
-                else:
-                    continue
-
-                conversation_id = chunk_old_data.get("conversation_id")
+                message_id = message.get("id")
                 content = message.get("content", {})
                 recipient = message.get("recipient", "")
-                current_message_id = message.get('id')
 
                 if not message and chunk_old_data.get("type") == "moderation":
                     delta = {"role": "assistant", "content": moderation_message}
@@ -151,10 +187,12 @@ async def stream_response(service, response, model, max_tokens):
                     if outer_content_type == "text":
                         part = content.get("parts", [])[0]
                         if not part:
-                            message_id = message.get("id")
-                            new_text = ""
+                            if last_role == 'tool' and role == 'assistant':
+                                new_text = "\n\n"
+                            else:
+                                new_text = ""
                         else:
-                            if message_id and message_id != message.get("id"):
+                            if last_message_id and last_message_id != message_id:
                                 continue
                             citation = message.get("metadata", {}).get("citations", [])
                             if len(citation) > len_last_citation:
@@ -164,6 +202,8 @@ async def stream_response(service, response, model, max_tokens):
                                 new_text = f' **[[""]]({citation_url} "{citation_title}")** '
                                 len_last_citation = len(citation)
                             else:
+                                if role == 'tool':
+                                    part = ">" + part.replace("\n\n", "\n>\n>")
                                 new_text = part[len_last_content:]
                             len_last_content = len(part)
                     else:
@@ -210,37 +250,36 @@ async def stream_response(service, response, model, max_tokens):
                         part = content.get("parts", [])[0]
                         new_text = part[len_last_content:]
                         if not new_text:
-                            delta = {}
+                            matches = re.findall(r'\(sandbox:(.*?)\)', part)
+                            if matches:
+                                file_url_content = ""
+                                for i, sandbox_path in enumerate(matches):
+                                    file_download_url = await service.get_response_file_url(conversation_id, message_id, sandbox_path)
+                                    if file_download_url:
+                                        file_url_content += f"\n```\n![File {i+1}]({file_download_url})\n"
+                                delta = {"content": file_url_content}
+                            else:
+                                delta = {}
                         else:
                             delta = {"content": new_text}
                         finish_reason = "stop"
                         end = True
                     else:
-                        message_id = None
+                        last_role = role
+                        last_message_id = None
                         len_last_content = 0
                         continue
                 else:
                     continue
+                last_message_id = message_id
+                last_role = role
                 if not end and not delta.get("content"):
                     delta = {"role": "assistant", "content": ""}
-                chunk_new_data = {
-                    "id": chat_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": delta,
-                            "logprobs": None,
-                            "finish_reason": finish_reason
-                        }
-                    ],
-                    "system_fingerprint": system_fingerprint
-                }
+                chunk_new_data["choices"][0]["delta"] = delta
+                chunk_new_data["choices"][0]["finish_reason"] = finish_reason
                 if not service.history_disabled:
                     chunk_new_data.update({
-                        "message_id": current_message_id,
+                        "message_id": message_id,
                         "conversation_id": conversation_id,
                     })
                 completion_tokens += 1
@@ -250,6 +289,12 @@ async def stream_response(service, response, model, max_tokens):
             else:
                 continue
         except Exception as e:
+            if chunk.startswith("data: "):
+                chunk_data = json.loads(chunk[6:])
+                if chunk_data.get("error"):
+                    logger.error(f"Error: {chunk_data.get('error')}")
+                    yield "data: [DONE]\n\n"
+                    break
             logger.error(f"Error: {chunk}, details: {str(e)}")
             continue
 
@@ -276,6 +321,8 @@ def format_messages_with_url(content):
             logger.info(f"Found a file_url from messages: {url}")
         else:
             break
+    if not url_list:
+        return content
     new_content = [
         {
             "type": "text",
@@ -319,6 +366,7 @@ async def api_messages_to_chat(service, api_messages, upload_by_url=False):
                         file_size = file_meta["size_bytes"]
                         file_name = file_meta["file_name"]
                         mime_type = file_meta["mime_type"]
+                        use_case = file_meta["use_case"]
                         if mime_type.startswith("image/"):
                             width, height = file_meta["width"], file_meta["height"]
                             file_tokens += await calculate_image_tokens(width, height, detail)
@@ -338,6 +386,8 @@ async def api_messages_to_chat(service, api_messages, upload_by_url=False):
                                 "height": height
                             })
                         else:
+                            if not use_case == "ace_upload":
+                                await service.check_upload(file_id)
                             file_tokens += file_size // 1000
                             attachments.append({
                                 "id": file_id,

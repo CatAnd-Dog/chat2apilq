@@ -12,10 +12,11 @@ from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
 
 from chatgpt.ChatService import ChatService
+from chatgpt.authorization import refresh_all_tokens
+import chatgpt.globals as globals
 from chatgpt.reverseProxy import chatgpt_reverse_proxy
 from utils.Logger import logger
-from utils.authorization import token_list, refresh_all_tokens
-from utils.config import api_prefix
+from utils.config import api_prefix, scheduled_refresh
 from utils.retry import async_retry
 
 warnings.filterwarnings("ignore")
@@ -36,9 +37,10 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def app_start():
-    scheduler.add_job(id='refresh', func=refresh_all_tokens, trigger='cron', hour=3, minute=0, day='*/4')
-    scheduler.start()
-    asyncio.get_event_loop().call_later(0, lambda: asyncio.create_task(refresh_all_tokens()))
+    if scheduled_refresh:
+        scheduler.add_job(id='refresh', func=refresh_all_tokens, trigger='cron', hour=3, minute=0, day='*/4', kwargs={'force_refresh': True})
+        scheduler.start()
+        asyncio.get_event_loop().call_later(0, lambda: asyncio.create_task(refresh_all_tokens(force_refresh=False)))
 
 
 async def to_send_conversation(request_data, req_token):
@@ -56,17 +58,21 @@ async def to_send_conversation(request_data, req_token):
         raise HTTPException(status_code=500, detail="Server error")
 
 
+async def process(request_data, req_token):
+    chat_service = await to_send_conversation(request_data, req_token)
+    await chat_service.prepare_send_conversation()
+    res = await chat_service.send_conversation()
+    return chat_service, res
+
+
 @app.post(f"/{api_prefix}/v1/chat/completions" if api_prefix else "/v1/chat/completions")
 async def send_conversation(request: Request, req_token: str = Depends(oauth2_scheme)):
     try:
         request_data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail={"error": "Invalid JSON body"})
-
-    chat_service = await async_retry(to_send_conversation, request_data, req_token)
+    chat_service, res = await async_retry(process, request_data, req_token)
     try:
-        await chat_service.prepare_send_conversation()
-        res = await chat_service.send_conversation()
         if isinstance(res, types.AsyncGeneratorType):
             background = BackgroundTask(chat_service.close_client)
             return StreamingResponse(res, media_type="text/event-stream", background=background)
@@ -87,7 +93,7 @@ async def send_conversation(request: Request, req_token: str = Depends(oauth2_sc
 
 @app.get(f"/{api_prefix}/tokens" if api_prefix else "/tokens", response_class=HTMLResponse)
 async def upload_html(request: Request):
-    tokens_count = len(token_list)
+    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return templates.TemplateResponse("tokens.html",
                                       {"request": request, "api_prefix": api_prefix, "tokens_count": tokens_count})
 
@@ -97,22 +103,29 @@ async def upload_post(text: str = Form(...)):
     lines = text.split("\n")
     for line in lines:
         if line.strip() and not line.startswith("#"):
-            token_list.append(line.strip())
+            globals.token_list.append(line.strip())
             with open("data/token.txt", "a", encoding="utf-8") as f:
                 f.write(line.strip() + "\n")
-    logger.info(f"Token list count: {len(token_list)}")
-    tokens_count = len(token_list)
+    logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
+    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
 
 
 @app.post(f"/{api_prefix}/tokens/clear" if api_prefix else "/tokens/clear")
 async def upload_post():
-    token_list.clear()
+    globals.token_list.clear()
+    globals.error_token_list.clear()
     with open("data/token.txt", "w", encoding="utf-8") as f:
         pass
-    logger.info(f"Token list count: {len(token_list)}")
-    tokens_count = len(token_list)
+    logger.info(f"Token count: {len(globals.token_list)}, Error token count: {len(globals.error_token_list)}")
+    tokens_count = len(set(globals.token_list) - set(globals.error_token_list))
     return {"status": "success", "tokens_count": tokens_count}
+
+
+@app.post(f"/{api_prefix}/tokens/error" if api_prefix else "/tokens/error")
+async def error_tokens():
+    error_tokens_list = list(set(globals.error_token_list))
+    return {"status": "success", "error_tokens": error_tokens_list}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"])
