@@ -6,7 +6,7 @@ import random
 
 from utils.Logger import logger
 
-DATA_FOLDER = "/tmp/data"
+DATA_FOLDER = "tmp"
 TOKENS_FILE = os.path.join(DATA_FOLDER, "token.txt")
 REFRESH_MAP_FILE = os.path.join(DATA_FOLDER, "refresh_map.json")
 ERROR_TOKENS_FILE = os.path.join(DATA_FOLDER, "error_token.txt")
