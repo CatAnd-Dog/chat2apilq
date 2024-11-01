@@ -34,8 +34,6 @@ impersonate_list = [
     "edge101",
 ]
 
-if not os.path.exists(DATA_FOLDER):
-    os.makedirs(DATA_FOLDER)
 
 if os.path.exists(REFRESH_MAP_FILE):
     with open(REFRESH_MAP_FILE, "r") as file:
